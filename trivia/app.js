@@ -20,22 +20,29 @@
   };
 
   const S = {
-    players: store.get('kt_players', []).map(p => ({ name: p.name, avatar: p.avatar, score: 0, bonus: 0 })),
+    players: store.get('kt_players', []).map(p => ({ name: p.name, avatar: p.avatar, score: +p.score || 0, bonus: +p.bonus || 0, rScore: 0, rBonus: 0 })),
     mode: store.get('kt_mode', 'allstar'),
     sound: store.get('kt_sound', true),
     autoRead: store.get('kt_autoread', false),
   };
   let skills = store.get('kt_skills', {});     // {player: {topicId: {skillId: evidence}}}
-  let reviewBank = store.get('kt_review', []); // [{player, topic, i}]
+  let reviewBank = store.get('kt_review', []); // [{player, topic, id}]
+  // No-repeat tracking, per device: {topicId: {seen: [questionIds], laps: timesFullyExplored}}
+  let seenStore = store.get('kt_seen', {});
+  const QBYID = {};
+  DATA.topics.forEach(t => t.questions.forEach((q, i) => { q.id = q.id || `${t.id}-${String(i + 1).padStart(3, '0')}`; QBYID[q.id] = { ...q, topic: t.id, i }; }));
+  reviewBank = reviewBank.map(r => (r.id || !topicById(r.topic) || !topicById(r.topic).questions[r.i]) ? r : { player: r.player, topic: r.topic, id: topicById(r.topic).questions[r.i].id })
+                         .filter(r => r.id && QBYID[r.id]);
 
   // ---------- helpers ----------
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
   const pick = a => a[Math.floor(Math.random() * a.length)];
   const shuffle = a => { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
-  const topicById = id => DATA.topics.find(t => t.id === id);
+  function topicById(id) { return DATA.topics.find(t => t.id === id); }
   const cur = () => S.players[S.turn];
   const h = (html) => { $app.innerHTML = html; window.scrollTo({ top: 0, behavior: 'smooth' }); };
-  const savePlayers = () => store.set('kt_players', S.players.map(p => ({ name: p.name, avatar: p.avatar })));
+  // score/bonus = running totals that carry across topics and reloads; rScore/rBonus = this round only
+  const savePlayers = () => store.set('kt_players', S.players.map(p => ({ name: p.name, avatar: p.avatar, score: p.score, bonus: p.bonus })));
 
   // Build shuffled options. choices[0] is the correct answer in the data file.
   function makeOptions(c, trim) {
@@ -110,7 +117,8 @@
       <p class="sub">Trivia + 🧠 Think-Deeper bonus points</p>
       <section class="card">
         <h2>👋 Who's playing?</h2>
-        <div class="players">${S.players.map((p, i) => `<span class="chip">${p.avatar} ${esc(p.name)} <button aria-label="remove" data-rm="${i}">✖</button></span>`).join('') || '<span class="muted">Add each player — you\'ll take turns!</span>'}</div>
+        <div class="players">${S.players.map((p, i) => `<span class="chip">${p.avatar} ${esc(p.name)} <span class="tot">⭐${p.score} 🧠${p.bonus}</span><button aria-label="remove ${esc(p.name)}" data-rm="${i}">✖</button></span>`).join('') || '<span class="muted">Add each player — you\'ll take turns!</span>'}</div>
+        ${S.players.some(p => p.score || p.bonus) ? '<p class="muted" style="margin:0 0 8px">🎒 Points add up across every topic you play!</p>' : ''}
         <form class="row" id="addForm"><input type="text" id="nameIn" maxlength="14" placeholder="Type a name" autocomplete="off"><button class="btn go small" type="submit">➕ Add</button></form>
       </section>
       <section class="card">
@@ -127,23 +135,35 @@
       <section class="card">
         <h2>🎯 Pick a topic!</h2>
         <div class="topics">
-          ${DATA.topics.map(t => `<button class="topic" style="background:${t.color}" data-topic="${t.id}"><span class="em">${t.emoji}</span>${t.name}</button>`).join('')}
-          <button class="topic" style="background:linear-gradient(135deg,#ff4fa3,#ffc83d)" data-topic="mix"><span class="em">🎲</span>Mix It Up!</button>
+          ${DATA.topics.map(t => `<button class="topic" style="background:${t.color}" data-topic="${t.id}"><span class="em">${t.emoji}</span>${t.name}<span class="explored">${exploredLabel(t.id, true)}</span></button>`).join('')}
+          <button class="topic" style="background:linear-gradient(135deg,#ff4fa3,#ffc83d)" data-topic="mix"><span class="em">🔀</span>Mix It Up!<span class="explored">${exploredLabel('mix', true)}</span></button>
         </div>
+        <button class="btn primary block" id="surprise" style="margin-top:12px">🎲 Surprise me!</button>
       </section>
       <section class="card">
         <h2>🧠 How bonus points work</h2>
         <p style="font-size:1.1rem;margin:0">After each question, tap <b>Think Deeper</b> for 2–3 "why / how / what if" questions.
         Each one answered = <b>+${DEEP_PTS} bonus</b>! Some are <b>talk-it-out</b> questions — say your answer out loud and a grown-up taps <b>🌟 Good thinking!</b></p>
       </section>
+      <section class="card grownup">
+        <h2>🧹 For grown-ups</h2>
+        <p class="muted" style="margin-top:0">Start a brand-new game: sets everyone's ⭐ and 🧠 back to 0 (players stay).</p>
+        <button class="btn small" id="resetScores">🔄 New game / reset scores</button>
+      </section>
       <p class="footer">${DATA.topics.reduce((n, t) => n + t.questions.length, 0)} questions · works offline once loaded · no ads, no accounts</p>`);
     $app.querySelector('#addForm').onsubmit = e => {
       e.preventDefault(); const v = $app.querySelector('#nameIn').value.trim(); if (!v) return;
       if (S.players.length >= 6) return toast('Max 6 players!');
-      S.players.push({ name: v, avatar: AVATARS[S.players.length % AVATARS.length], score: 0, bonus: 0 }); savePlayers(); bling(); renderHome();
+      S.players.push({ name: v, avatar: AVATARS[S.players.length % AVATARS.length], score: 0, bonus: 0, rScore: 0, rBonus: 0 }); savePlayers(); bling(); renderHome();
       $app.querySelector('#nameIn').focus();
     };
-    $app.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { S.players.splice(+b.dataset.rm, 1); savePlayers(); renderHome(); });
+    $app.querySelectorAll('[data-rm]').forEach(b => b.onclick = () => { const p = S.players[+b.dataset.rm];
+      if ((p.score || p.bonus) && !confirm(`Remove ${p.name} and their ${p.score + p.bonus} points?`)) return;
+      S.players.splice(+b.dataset.rm, 1); savePlayers(); renderHome(); });
+    $app.querySelector('#surprise').onclick = () => { const t = pick(DATA.topics); bling(); toast(`🎲 ${t.emoji} ${t.name}!`); setTimeout(() => startTopic(t.id), 600); };
+    $app.querySelector('#resetScores').onclick = () => {
+      if (!confirm('Start a new game? Everyone\'s ⭐ and 🧠 points go back to 0. (Players and explored questions stay.)')) return;
+      S.players.forEach(p => { p.score = p.bonus = p.rScore = p.rBonus = 0; }); savePlayers(); toast('🔄 Fresh start — good luck!'); renderHome(); };
     $app.querySelectorAll('[data-mode]').forEach(b => b.onclick = () => { S.mode = b.dataset.mode; store.set('kt_mode', S.mode); renderHome(); });
     $app.querySelector('#autoRead').onclick = () => { S.autoRead = !S.autoRead; store.set('kt_autoread', S.autoRead); renderHome(); };
     $app.querySelector('#sound').onclick = () => { S.sound = !S.sound; store.set('kt_sound', S.sound); renderHome(); };
@@ -152,30 +172,61 @@
 
   // ---------- GAME ----------
   function startTopic(id) {
-    if (!S.players.length) { S.players.push({ name: 'Player 1', avatar: '🦊', score: 0, bonus: 0 }); }
-    S.players.forEach(p => { p.score = 0; p.bonus = 0; });
+    if (!S.players.length) { S.players.push({ name: 'Player 1', avatar: '🦊', score: 0, bonus: 0, rScore: 0, rBonus: 0 }); savePlayers(); }
+    S.players.forEach(p => { p.rScore = 0; p.rBonus = 0; }); // round points reset; running totals carry over
     S.topicId = id;
-    if (id === 'mix') {
-      const all = DATA.topics.flatMap(t => t.questions.map((q, i) => ({ ...q, topic: t.id, i })));
-      S.queue = shuffle(all).slice(0, 10);
-    } else {
-      S.queue = shuffle(topicById(id).questions.map((q, i) => ({ ...q, topic: id, i })));
-    }
-    S.idx = 0; S.turn = 0; S.missed = []; S.deepAnswered = 0;
+    S.queue = drawQuestions(id === 'mix' ? DATA.topics.map(t => t.id) : [id], 10);
+    S.idx = 0; S.turn = 0; S.missed = []; S.deepAnswered = 0; S.justFinishedLap = null;
     renderQuestion();
   }
 
+  // ---------- NO-REPEAT DRAW ----------
+  const seenOf = t => (seenStore[t] = seenStore[t] || { seen: [], laps: 0 });
+  const saveSeen = () => store.set('kt_seen', seenStore);
+  function markSeen(q) {
+    const s = seenOf(q.topic); if (!s.seen.includes(q.id)) s.seen.push(q.id);
+    const total = topicById(q.topic).questions.length;
+    if (s.seen.length >= total) { s.laps++; s.seen = []; S.justFinishedLap = q.topic; } // fully explored -> reshuffle next time
+    saveSeen();
+  }
+  // Unseen questions first; only when a topic runs out do we reuse its questions (a fresh shuffle).
+  function drawQuestions(topicIds, n) {
+    const pool = topicIds.flatMap(t => topicById(t).questions.map(q => QBYID[q.id]));
+    const isSeen = q => seenOf(q.topic).seen.includes(q.id);
+    let picked;
+    if (topicIds.length > 1) {
+      // Mix It Up: deal round-robin from each topic's shuffled unseen pile so topics stay balanced
+      const piles = shuffle(topicIds).map(t => shuffle(pool.filter(q => q.topic === t && !isSeen(q))));
+      picked = [];
+      while (picked.length < n && piles.some(p => p.length)) piles.forEach(p => { if (p.length && picked.length < n) picked.push(p.pop()); });
+    } else picked = shuffle(pool.filter(q => !isSeen(q))).slice(0, n);
+    if (picked.length < n) { // topic(s) almost exhausted: top up with already-seen ones (never repeats within a game)
+      const ids = new Set(picked.map(q => q.id));
+      picked = picked.concat(shuffle(pool.filter(q => !ids.has(q.id))).slice(0, n - picked.length));
+    }
+    return shuffle(picked);
+  }
+  function exploredLabel(topicId, short) {
+    const ids = topicId === 'mix' ? DATA.topics.map(t => t.id) : [topicId];
+    const total = ids.reduce((a, t) => a + topicById(t).questions.length, 0);
+    const seen = ids.reduce((a, t) => a + seenOf(t).seen.length, 0);
+    const laps = topicId === 'mix' ? 0 : seenOf(topicId).laps;
+    const name = topicId === 'mix' ? 'questions' : topicById(topicId).name + ' questions';
+    if (short) return `🔭 ${seen}/${total}${laps ? ` · 🏅×${laps}` : ''}`;
+    return `🔭 ${seen} of ${total} ${name} explored${laps ? ` — explored them all ${laps}× already! 🏅` : ''}`;
+  }
+
   function hud() {
-    const p = cur(); const t = S.topicId === 'mix' ? { emoji: '🎲', name: 'Mix It Up' } : topicById(S.topicId);
+    const p = cur(); const t = S.topicId === 'mix' ? { emoji: '🔀', name: 'Mix It Up' } : topicById(S.topicId);
     return `<div class="hud"><button class="btn small" id="homeBtn" aria-label="Home">🏠</button><span class="pill">${t.emoji} ${t.name}</span>
-      <span class="pill">⭐ ${p.score}</span><span class="pill bonus">🧠 +${p.bonus}</span></div>
+      <span class="pill" title="Total trivia points">⭐ ${p.score}</span><span class="pill bonus" title="Total bonus points">🧠 +${p.bonus}</span></div>
       <div class="progress"><div style="width:${(S.idx / S.queue.length) * 100}%"></div></div>
       ${S.players.length > 1 ? `<div class="turn">${p.avatar} ${esc(p.name)}'s turn!</div>` : ''}`;
   }
-  function wireHome() { const b = $app.querySelector('#homeBtn'); if (b) b.onclick = () => { if (confirm('Go back to the start? This game\'s points will be lost.')) renderHome(); }; }
+  function wireHome() { const b = $app.querySelector('#homeBtn'); if (b) b.onclick = () => { savePlayers(); renderHome(); toast('🎒 Switch topic? Your points come with you!'); }; }
 
   function award(kind, pts) {
-    const p = cur(); if (kind === 'bonus') p.bonus += pts; else p.score += pts;
+    const p = cur(); if (kind === 'bonus') { p.bonus += pts; p.rBonus += pts; } else { p.score += pts; p.rScore += pts; } savePlayers();
     toast(kind === 'bonus' ? `🧠 +${pts} BONUS!` : `⭐ +${pts}`);
     $app.querySelectorAll('.pill').forEach(el => { if (kind === 'bonus' && el.classList.contains('bonus')) el.textContent = `🧠 +${p.bonus}`; else if (kind !== 'bonus' && el.textContent.startsWith('⭐')) el.textContent = `⭐ ${p.score}`; });
   }
@@ -235,6 +286,7 @@
 
   function renderQuestion() {
     const q = S.queue[S.idx];
+    markSeen(q);
     h(`${hud()}<section class="card" id="qcard"></section>`); wireHome();
     const card = $app.querySelector('#qcard');
     card.insertAdjacentHTML('beforebegin', `<p class="sub" style="margin:6px 0 0">Question ${S.idx + 1} of ${S.queue.length}</p>`);
@@ -243,7 +295,7 @@
         if (correct) { award('score', tries ? MAIN_PTS_CLUE : MAIN_PTS); addEvidence(cur().name, q.topic, q.skill, tries ? 0.5 : 1); }
         else addEvidence(cur().name, q.topic, q.skill, -0.5);
         if (!correct || tries) S.missed.push({ q, player: S.turn });
-        if (!correct) rememberMiss(cur().name, q.topic, q.i);
+        if (!correct) rememberMiss(cur().name, q.topic, q.id);
         acts.innerHTML = `
           <button class="btn deep block" id="deepBtn">🧠 Think Deeper! <small>(+${DEEP_PTS} bonus each)</small></button>
           <button class="btn primary block" id="nextBtn">${S.idx + 1 < S.queue.length ? 'Next question ➡️' : 'See results 🏁'}</button>`;
@@ -302,16 +354,16 @@
   }
 
   // ---------- SPACED REVIEW ----------
-  function rememberMiss(player, topic, i) {
-    if (!reviewBank.some(r => r.player === player && r.topic === topic && r.i === i)) reviewBank.push({ player, topic, i });
+  function rememberMiss(player, topic, id) {
+    if (!reviewBank.some(r => r.player === player && r.id === id)) reviewBank.push({ player, topic, id });
     reviewBank = reviewBank.slice(-40); store.set('kt_review', reviewBank);
   }
   function startReview() {
-    const inRound = new Set(S.queue.map(q => q.topic + ':' + q.i));
+    const inRound = new Set(S.queue.map(q => q.id));
     let list = S.missed.slice(-2).map(m => ({ ...m, why: 'from this round' }));
     // plus one older miss from a past game (true spaced review), for any player in this game
-    const old = shuffle(reviewBank.filter(r => !inRound.has(r.topic + ':' + r.i) && S.players.some(p => p.name === r.player)))[0];
-    if (old) { const t = topicById(old.topic); if (t && t.questions[old.i]) list.push({ q: { ...t.questions[old.i], topic: old.topic, i: old.i }, player: S.players.findIndex(p => p.name === old.player), why: 'from an earlier game' }); }
+    const old = shuffle(reviewBank.filter(r => !inRound.has(r.id) && QBYID[r.id] && S.players.some(p => p.name === r.player)))[0];
+    if (old) list.push({ q: QBYID[old.id], player: S.players.findIndex(p => p.name === old.player), why: 'from an earlier game' });
     S.review = list;
     if (!list.length) return renderResults();
     h(`<section class="card center"><div class="big-emoji">🔁</div><h2>Bonus Review Round!</h2>
@@ -326,9 +378,9 @@
     mcWidget({ container: $app.querySelector('#rbody'), q: r.q.q, choices: r.q.c, hint: null, why: r.q.why,
       onDone: ({ correct, tries, acts }) => {
         const nm = cur().name;
-        if (correct && !tries) { award('bonus', REVIEW_PTS); addEvidence(nm, r.q.topic, r.q.skill, 1); reviewBank = reviewBank.filter(x => !(x.player === nm && x.topic === r.q.topic && x.i === r.q.i)); store.set('kt_review', reviewBank); }
-        else if (correct) { award('bonus', 2); rememberMiss(nm, r.q.topic, r.q.i); }
-        else { addEvidence(nm, r.q.topic, r.q.skill, -0.5); rememberMiss(nm, r.q.topic, r.q.i); }
+        if (correct && !tries) { award('bonus', REVIEW_PTS); addEvidence(nm, r.q.topic, r.q.skill, 1); reviewBank = reviewBank.filter(x => !(x.player === nm && x.id === r.q.id)); store.set('kt_review', reviewBank); }
+        else if (correct) { award('bonus', 2); rememberMiss(nm, r.q.topic, r.q.id); }
+        else { addEvidence(nm, r.q.topic, r.q.skill, -0.5); rememberMiss(nm, r.q.topic, r.q.id); }
         acts.innerHTML = `<button class="btn primary block" id="rn">${k + 1 < S.review.length ? 'Next ➡️' : 'See results 🏁'}</button>`;
         acts.querySelector('#rn').onclick = () => k + 1 < S.review.length ? renderReview(k + 1) : renderResults();
       } });
@@ -337,14 +389,15 @@
   // ---------- RESULTS ----------
   function renderResults() {
     stopSpeech(); confetti(200); yay();
-    const ranked = S.players.map(p => ({ ...p, total: p.score + p.bonus })).sort((a, b) => b.total - a.total);
+    const ranked = S.players.map(p => ({ ...p, round: p.rScore + p.rBonus, total: p.score + p.bonus })).sort((a, b) => b.round - a.round || b.total - a.total);
     const medals = ['🥇','🥈','🥉','🏅','🏅','🏅'];
     const topics = S.topicId === 'mix' ? [...new Set(S.queue.map(q => q.topic))] : [S.topicId];
     const top = ranked[0];
-    const msg = S.players.length > 1 ? `Awesome game, everyone! 🎉` : (top.score >= 80 ? 'TRIVIA CHAMPION! 🏆' : top.score >= 50 ? 'Super smart! 🌟' : 'Great playing — your brain grew today! 🌱');
+    const msg = S.players.length > 1 ? `Awesome game, everyone! 🎉` : (top.rScore >= 80 ? 'TRIVIA CHAMPION! 🏆' : top.rScore >= 50 ? 'Super smart! 🌟' : 'Great playing — your brain grew today! 🌱');
     h(`<section class="card results center"><div class="big-emoji">🏆</div><h2 style="font-size:1.8rem">${msg}</h2>
-        ${ranked.map((p, i) => `<div class="player"><span>${S.players.length > 1 ? medals[i] : ''} ${p.avatar} ${esc(p.name)}</span><span>⭐ ${p.score} + 🧠 ${p.bonus} = <b>${p.total}</b></span></div>`).join('')}
-        <p class="muted">⭐ = trivia points · 🧠 = Think Deeper bonus</p>
+        ${ranked.map((p, i) => `<div class="player"><span>${S.players.length > 1 ? medals[i] : ''} ${p.avatar} ${esc(p.name)}</span><span class="pts"><b class="round">+${p.round}</b><small>this round (⭐${p.rScore} 🧠${p.rBonus})</small><small>🎒 total <b>${p.total}</b> (⭐${p.score} 🧠${p.bonus})</small></span></div>`).join('')}
+        <p class="muted">⭐ = trivia points · 🧠 = Think Deeper bonus · 🎒 totals carry across topics</p>
+        <div class="explore-banner">${S.justFinishedLap ? `🎉 You explored EVERY ${esc(topicById(S.justFinishedLap).name)} question! Next game reshuffles them all.` : exploredLabel(S.topicId)}</div>
       </section>
       <section class="card"><h2>🗺️ Brain Map</h2><p class="muted" style="margin-top:0">Levels go up as you answer things right more than once — and come down if you forget. Keep playing to reach 5/5!</p>
         ${S.players.map(p => `<p style="font-weight:900;margin:12px 0 4px">${p.avatar} ${esc(p.name)}</p>${topics.map(t => skillMapHTML(p.name, t)).join('')}`).join('')}
@@ -354,6 +407,6 @@
     $app.querySelector('#home').onclick = renderHome;
   }
 
-  window.__kt = { S, startTopic, renderHome }; // for testing
+  window.__kt = { S, startTopic, renderHome, drawQuestions, seen: () => seenStore }; // for testing
   renderHome();
 })();
