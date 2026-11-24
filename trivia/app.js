@@ -56,7 +56,7 @@
   function loadTopic(id) {
     if (attachTopic(id)) return Promise.resolve();
     return loading[id] = loading[id] || new Promise((res, rej) => {
-      const sc = document.createElement('script'); sc.src = `questions/${id}.js?v=3`;
+      const sc = document.createElement('script'); sc.src = `questions/${id}.js?v=4`;
       sc.onload = () => attachTopic(id) ? res() : rej(new Error('no data'));
       sc.onerror = () => { delete loading[id]; sc.remove(); rej(new Error('load failed')); };
       document.head.appendChild(sc);
@@ -103,14 +103,88 @@
   const hmm = () => tone([330, 262], 0.16, 'sine');
   const bling = () => tone([880, 1175, 1568], 0.08, 'square');
 
-  function speak(text) {
-    if (!('speechSynthesis' in window)) { toast('Read-aloud isn\'t supported on this browser 😕'); return; }
-    speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text.replace(/[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/gu, ''));
-    u.rate = 0.95; u.pitch = 1.1; u.lang = 'en-CA';
-    speechSynthesis.speak(u);
+  // ---------- read-aloud: pick the most natural built-in English voice ----------
+  const HAS_TTS = !!(window.speechSynthesis && window.SpeechSynthesisUtterance);
+  const NOVELTY = /\b(albert|bad news|bahh|bells|boing|bubbles|cellos|deranged|fred|good news|hysterical|jester|junior|organ|pipe organ|superstar|trinoids|whisper|wobble|zarvox|ralph|kathy|princess)\b|espeak|e-speak|mbrola/i;
+  const GOOD_NAMES = /\b(samantha|ava|allison|karen|daniel|moira|tessa|serena|zoe|evan|nathan|joelle|susan|tom|noelle|nicky|kate|oliver|lee|aria|jenny|guy|libby|sonia|ryan|clara|liam|natasha|william|emma|brian|andrew|michelle)\b/i;
+  function scoreVoice(v) {
+    const lang = (v.lang || '').replace('_', '-').toLowerCase(), name = v.name || '';
+    if (!lang.startsWith('en') || NOVELTY.test(name)) return -Infinity;
+    let s = { 'en-ca': 30, 'en-us': 26, 'en-gb': 22, 'en-au': 16, 'en-ie': 16, 'en-nz': 16 }[lang.slice(0, 5)] ?? 8;
+    if (/premium/i.test(name)) s += 70;
+    if (/enhanced/i.test(name)) s += 60;
+    if (/neural|natural/i.test(name)) s += 60;
+    if (/online/i.test(name)) s += 35;
+    if (/google/i.test(name)) s += 40;
+    if (/siri/i.test(name)) s += 45;
+    if (GOOD_NAMES.test(name)) s += 30;
+    if (/compact|legacy|robot|monotone/i.test(name)) s -= 25;
+    if (/microsoft (david|zira|mark|hazel|george|susan)\b(?!.*(online|natural))/i.test(name)) s -= 10; // old SAPI voices
+    if (v.default) s += 3;
+    return s;
   }
-  const stopSpeech = () => { if ('speechSynthesis' in window) speechSynthesis.cancel(); };
+  let allVoices = [];
+  const englishVoices = () => allVoices.filter(v => scoreVoice(v) > -Infinity).sort((a, b) => scoreVoice(b) - scoreVoice(a) || a.name.localeCompare(b.name));
+  function chosenVoice() {
+    const list = englishVoices(), want = store.get('kt_voice', '');
+    return (want && list.find(v => v.voiceURI === want || v.name === want)) || list[0] || null;
+  }
+  function refreshVoices() {
+    if (!HAS_TTS) return;
+    const vs = speechSynthesis.getVoices() || [];
+    if (vs.length && vs.length !== allVoices.length) { allVoices = vs.slice(); renderVoicePicker(); }
+  }
+  if (HAS_TTS) {
+    refreshVoices();
+    if (speechSynthesis.addEventListener) speechSynthesis.addEventListener('voiceschanged', refreshVoices);
+    else speechSynthesis.onvoiceschanged = refreshVoices;
+    // iOS Safari often never fires voiceschanged and returns [] at first: poll briefly.
+    let tries = 0; const poll = setInterval(() => { refreshVoices(); if (allVoices.length || ++tries > 20) clearInterval(poll); }, 250);
+  }
+  // Split into sentences (long utterances get cut off in Chrome and sound flat); keep pieces under ~160 chars.
+  function chunks(text) {
+    const clean = String(text).replace(/_{2,}/g, ' blank ').replace(/[\u{1F300}-\u{1FAFF}\u{1F000}-\u{1F2FF}\u2600-\u27BF\uFE0F\u200D]/gu, '').replace(/\s+/g, ' ').trim();
+    const out = [];
+    (clean.match(/[^.!?…]+[.!?…]+["')\]]*|[^.!?…]+$/g) || []).forEach(sn => {
+      sn = sn.trim(); if (!sn) return;
+      while (sn.length > 160) { let cut = sn.lastIndexOf(',', 160); if (cut < 40) cut = sn.lastIndexOf(' ', 160); if (cut < 40) cut = 160; out.push(sn.slice(0, cut + 1).trim()); sn = sn.slice(cut + 1).trim(); }
+      if (sn) out.push(sn);
+    });
+    return out;
+  }
+  let speakTimer;
+  function speak(text) {
+    if (!HAS_TTS) { toast('Read-aloud isn\'t supported on this browser 😕'); return; }
+    refreshVoices(); speechSynthesis.cancel(); clearTimeout(speakTimer);
+    const v = chosenVoice(), parts = chunks(text);
+    // tiny delay after cancel(): Chrome/Safari sometimes drop an utterance queued in the same tick as cancel()
+    speakTimer = setTimeout(() => parts.forEach(p => {
+      const u = new SpeechSynthesisUtterance(p);
+      if (v) { u.voice = v; u.lang = v.lang; } else u.lang = 'en-CA';
+      u.rate = 0.9; u.pitch = 1.03; u.volume = 1;
+      speechSynthesis.speak(u);
+    }), 60);
+    if (speechSynthesis.paused) speechSynthesis.resume();
+  }
+  const stopSpeech = () => { clearTimeout(speakTimer); if (HAS_TTS) speechSynthesis.cancel(); };
+  function voicePickerHTML() {
+    if (!HAS_TTS) return '<p class="muted">Read-aloud isn\'t available in this browser.</p>';
+    const list = englishVoices(), want = store.get('kt_voice', ''), best = list[0];
+    const label = v => `${v.name} (${v.lang})`;
+    return `<label class="vlabel" for="voiceSel">🎙️ Read-aloud voice</label>
+      <div class="row vrow"><select id="voiceSel">
+        <option value="">✨ Automatic${best ? ` — ${esc(label(best))}` : ' (loading voices…)'}</option>
+        ${list.map(v => `<option value="${esc(v.voiceURI || v.name)}" ${want && (v.voiceURI === want || v.name === want) ? 'selected' : ''}>${esc(label(v))}</option>`).join('')}
+      </select><button class="btn small go" id="voiceTest">▶️ Test</button></div>
+      <p class="muted vtip">💡 For the nicest voice on iPhone/iPad: Settings › Accessibility › Spoken Content › Voices › English, and download an Enhanced or Premium voice.</p>`;
+  }
+  function renderVoicePicker() {
+    const box = document.getElementById('voiceBox'); if (!box) return;
+    box.innerHTML = voicePickerHTML();
+    const sel = box.querySelector('#voiceSel'), test = box.querySelector('#voiceTest');
+    if (sel) sel.onchange = () => { store.set('kt_voice', sel.value); speak('Hi there! This is my reading voice.'); };
+    if (test) test.onclick = () => speak('Hooray! You\'re a trivia superstar. Let\'s go on a brain adventure!');
+  }
 
   const cv = document.getElementById('confetti'), cx = cv.getContext('2d');
   let parts = [], raf = null;
@@ -186,6 +260,7 @@
         <h2>🧹 For grown-ups</h2>
         <p class="muted" style="margin-top:0">Start a brand-new game: sets everyone's ⭐ and 🧠 back to 0 (players stay).</p>
         <button class="btn small" id="resetScores">🔄 New game / reset scores</button>
+        <div id="voiceBox" class="voicebox"></div>
       </section>
       <p class="footer">${TOTAL_Q} questions · ${DATA.topics.reduce((n, t) => n + (t.holes || []).length, 0)} rabbit holes · no ads, no accounts</p>`);
     $app.querySelector('#addForm').onsubmit = e => {
@@ -206,6 +281,7 @@
     $app.querySelector('#sound').onclick = () => { S.sound = !S.sound; store.set('kt_sound', S.sound); renderHome(); };
     $app.querySelectorAll('[data-topic]').forEach(b => b.onclick = () => startTopic(b.dataset.topic));
     $app.querySelector('#holes').onclick = renderExploreHome;
+    renderVoicePicker();
   }
 
   // ---------- GAME ----------
@@ -288,7 +364,7 @@
       <div class="fb"></div><div class="actions"></div>`;
     const fb = container.querySelector('.fb'), acts = container.querySelector('.actions');
     const btns = [...container.querySelectorAll('.choice')];
-    container.querySelector('.speak').onclick = () => speak(q + '. ' + opts.map((o, i) => (i ? ', or ' : '') + o.text).join('') + '?');
+    container.querySelector('.speak').onclick = () => speak(q.replace(/[\s.?!…]*$/, '?') + ' ' + opts.map((o, i) => (i ? ', or ' : '') + o.text).join('') + '?');
     if (S.autoRead) setTimeout(() => container.querySelector('.speak').click(), 250);
     if (justTell) {
       acts.innerHTML = `<button class="btn small" id="justTell">🙋 Just tell me</button>`;
@@ -563,6 +639,6 @@
     $app.querySelector('#home').onclick = renderHome;
   }
 
-  window.__kt = { S, startTopic, renderHome, drawQuestions, seen: () => seenStore, nodes: () => nodeStore, NODE, QBYID, ensureTopics, renderExploreHome, renderExploreTopic, holeFor, topicById, renderQuestion }; // for testing
+  window.__kt = { S, startTopic, renderHome, drawQuestions, seen: () => seenStore, nodes: () => nodeStore, NODE, QBYID, ensureTopics, renderExploreHome, renderExploreTopic, holeFor, topicById, renderQuestion, scoreVoice, chosenVoice, englishVoices, chunks, speak }; // for testing
   renderHome();
 })();
