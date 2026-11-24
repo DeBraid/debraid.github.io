@@ -11,7 +11,7 @@
   const SHAPES = ['🔺','🔷','⭐','🟢'];
   const CHEERS = ['WOO-HOO! 🎉','You got it! 🌟','Brain power! 🧠','Nailed it! 🎯','Superstar! ⭐','Amazing! 🚀','Yes yes YES! 🙌'];
   const KIND = ['Good try! 💪','Ooh, so close! 🤏','Great guess! 🌈','Now you know! 💡','Brains grow from mistakes! 🌱'];
-  const DEEP_PTS = 5, DEEP_PTS_CLUE = 3, MAIN_PTS = 10, MAIN_PTS_CLUE = 5, REVIEW_PTS = 5, DEFEND_PTS = 2;
+  const LEVEL_PTS = [5, 7, 10, 12, 15], REVISIT_PTS = 2, MAIN_PTS = 10, MAIN_PTS_CLUE = 5, REVIEW_PTS = 5, DEFEND_PTS = 2;
   const LEVEL_NAMES = ['new!','heard of it','following along','with a little help','on my own ⭐','can teach it! 🏆'];
 
   const store = {
@@ -29,10 +29,45 @@
   let reviewBank = store.get('kt_review', []); // [{player, topic, id}]
   // No-repeat tracking, per device: {topicId: {seen: [questionIds], laps: timesFullyExplored}}
   let seenStore = store.get('kt_seen', {});
-  const QBYID = {};
-  DATA.topics.forEach(t => t.questions.forEach((q, i) => { q.id = q.id || `${t.id}-${String(i + 1).padStart(3, '0')}`; QBYID[q.id] = { ...q, topic: t.id, i }; }));
-  reviewBank = reviewBank.map(r => (r.id || !topicById(r.topic) || !topicById(r.topic).questions[r.i]) ? r : { player: r.player, topic: r.topic, id: topicById(r.topic).questions[r.i].id })
-                         .filter(r => r.id && QBYID[r.id]);
+  const QBYID = {};   // question id -> {...question, topic, i}  (only for loaded topics)
+  const NODE = {};    // follow-up / rabbit-hole node id -> {n, topic, hole?, parent?, qid?}
+  let nodeStore = store.get('kt_nodes', {}); // explored follow-up & rabbit-hole nodes, per device: {nodeId: 1}
+  window.TRIVIA_TOPICS = window.TRIVIA_TOPICS || {};
+  const TOTAL_Q = DATA.topics.reduce((n, t) => n + (t.count || (t.questions || []).length), 0);
+  // Attach a topic's questions + rabbit holes once its file (questions/<id>.js) has loaded.
+  function attachTopic(id) {
+    const t = topicById(id), src = window.TRIVIA_TOPICS[id];
+    if (!t || t.loaded || !src) return !!(t && t.loaded);
+    t.questions = src.questions; t.holes = src.holes || []; t.count = t.questions.length; t.loaded = true;
+    t.questions.forEach((q, i) => {
+      q.deeper.forEach((d, k) => { d.id = d.id || `${q.id}~${k}`; NODE[d.id] = { n: d, topic: id, qid: q.id }; });
+      QBYID[q.id] = { ...q, topic: id, i };
+    });
+    t.holes.forEach(hole => {
+      hole.topic = id; hole.re = new RegExp(hole.match, 'i'); hole.all = [];
+      const walk = (n, parent) => { NODE[n.id] = { n, topic: id, hole, parent }; hole.all.push(n); n.next.forEach(c => walk(c, n)); };
+      walk(hole.root, null);
+    });
+    // migrate very old review entries that stored an index instead of an id
+    reviewBank = reviewBank.map(r => (!r.id && r.topic === id && t.questions[r.i]) ? { player: r.player, topic: id, id: t.questions[r.i].id } : r);
+    return true;
+  }
+  const loading = {};
+  function loadTopic(id) {
+    if (attachTopic(id)) return Promise.resolve();
+    return loading[id] = loading[id] || new Promise((res, rej) => {
+      const sc = document.createElement('script'); sc.src = `questions/${id}.js?v=3`;
+      sc.onload = () => attachTopic(id) ? res() : rej(new Error('no data'));
+      sc.onerror = () => { delete loading[id]; sc.remove(); rej(new Error('load failed')); };
+      document.head.appendChild(sc);
+    });
+  }
+  function ensureTopics(ids) {
+    const slow = setTimeout(() => toast('⏳ Loading questions…'), 400);
+    return Promise.all(ids.map(loadTopic)).finally(() => clearTimeout(slow))
+      .catch(e => { toast('😕 Couldn\'t load those questions — check the internet and try again'); throw e; });
+  }
+  DATA.topics.forEach(t => attachTopic(t.id)); // the single-file build already has everything
 
   // ---------- helpers ----------
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
@@ -139,18 +174,20 @@
           <button class="topic" style="background:linear-gradient(135deg,#ff4fa3,#ffc83d)" data-topic="mix"><span class="em">🔀</span>Mix It Up!<span class="explored">${exploredLabel('mix', true)}</span></button>
         </div>
         <button class="btn primary block" id="surprise" style="margin-top:12px">🎲 Surprise me!</button>
+        <button class="btn holebtn block" id="holes" style="margin-top:10px">🕳️ Rabbit Holes <small>wander deep — no quiz!</small></button>
       </section>
       <section class="card">
         <h2>🧠 How bonus points work</h2>
-        <p style="font-size:1.1rem;margin:0">After each question, tap <b>Think Deeper</b> for 2–3 "why / how / what if" questions.
-        Each one answered = <b>+${DEEP_PTS} bonus</b>! Some are <b>talk-it-out</b> questions — say your answer out loud and a grown-up taps <b>🌟 Good thinking!</b></p>
+        <p style="font-size:1.1rem;margin:0">After each question, <b>pick a door</b>: 🤔 <b>Why?</b> · 🔮 <b>What if…?</b> · 🔍 <b>Tell me more</b> · 🕳️ <b>Rabbit hole</b>.
+        Every answer opens new doors — the deeper you go, the bigger the 🧠 bonus: <b>+${LEVEL_PTS.join(', +')}</b>! Stop any time with 🏁.
+        Some are <b>talk-it-out</b> questions — say your answer out loud and a grown-up taps <b>🌟 Good thinking!</b></p>
       </section>
       <section class="card grownup">
         <h2>🧹 For grown-ups</h2>
         <p class="muted" style="margin-top:0">Start a brand-new game: sets everyone's ⭐ and 🧠 back to 0 (players stay).</p>
         <button class="btn small" id="resetScores">🔄 New game / reset scores</button>
       </section>
-      <p class="footer">${DATA.topics.reduce((n, t) => n + t.questions.length, 0)} questions · works offline once loaded · no ads, no accounts</p>`);
+      <p class="footer">${TOTAL_Q} questions · ${DATA.topics.reduce((n, t) => n + (t.holes || []).length, 0)} rabbit holes · no ads, no accounts</p>`);
     $app.querySelector('#addForm').onsubmit = e => {
       e.preventDefault(); const v = $app.querySelector('#nameIn').value.trim(); if (!v) return;
       if (S.players.length >= 6) return toast('Max 6 players!');
@@ -168,16 +205,20 @@
     $app.querySelector('#autoRead').onclick = () => { S.autoRead = !S.autoRead; store.set('kt_autoread', S.autoRead); renderHome(); };
     $app.querySelector('#sound').onclick = () => { S.sound = !S.sound; store.set('kt_sound', S.sound); renderHome(); };
     $app.querySelectorAll('[data-topic]').forEach(b => b.onclick = () => startTopic(b.dataset.topic));
+    $app.querySelector('#holes').onclick = renderExploreHome;
   }
 
   // ---------- GAME ----------
   function startTopic(id) {
     if (!S.players.length) { S.players.push({ name: 'Player 1', avatar: '🦊', score: 0, bonus: 0, rScore: 0, rBonus: 0 }); savePlayers(); }
     S.players.forEach(p => { p.rScore = 0; p.rBonus = 0; }); // round points reset; running totals carry over
-    S.topicId = id;
-    S.queue = drawQuestions(id === 'mix' ? DATA.topics.map(t => t.id) : [id], 10);
-    S.idx = 0; S.turn = 0; S.missed = []; S.deepAnswered = 0; S.justFinishedLap = null;
-    renderQuestion();
+    const ids = id === 'mix' ? DATA.topics.map(t => t.id) : [id];
+    return ensureTopics(ids).then(() => {
+      S.topicId = id; S.dive = null;
+      S.queue = drawQuestions(ids, 10);
+      S.idx = 0; S.turn = 0; S.missed = []; S.deepAnswered = 0; S.maxLevel = 0; S.justFinishedLap = null;
+      renderQuestion();
+    }).catch(() => {});
   }
 
   // ---------- NO-REPEAT DRAW ----------
@@ -185,7 +226,7 @@
   const saveSeen = () => store.set('kt_seen', seenStore);
   function markSeen(q) {
     const s = seenOf(q.topic); if (!s.seen.includes(q.id)) s.seen.push(q.id);
-    const total = topicById(q.topic).questions.length;
+    const total = topicById(q.topic).count;
     if (s.seen.length >= total) { s.laps++; s.seen = []; S.justFinishedLap = q.topic; } // fully explored -> reshuffle next time
     saveSeen();
   }
@@ -208,7 +249,7 @@
   }
   function exploredLabel(topicId, short) {
     const ids = topicId === 'mix' ? DATA.topics.map(t => t.id) : [topicId];
-    const total = ids.reduce((a, t) => a + topicById(t).questions.length, 0);
+    const total = ids.reduce((a, t) => a + topicById(t).count, 0);
     const seen = ids.reduce((a, t) => a + seenOf(t).seen.length, 0);
     const laps = topicId === 'mix' ? 0 : seenOf(topicId).laps;
     const name = topicId === 'mix' ? 'questions' : topicById(topicId).name + ' questions';
@@ -217,13 +258,18 @@
   }
 
   function hud() {
-    const p = cur(); const t = S.topicId === 'mix' ? { emoji: '🔀', name: 'Mix It Up' } : topicById(S.topicId);
+    const p = cur();
+    if (S.dive && S.dive.mode === 'explore') { const t = topicById(S.dive.topic);
+      return `<div class="hud"><button class="btn small" id="homeBtn" aria-label="Home">🏠</button><span class="pill">🕳️ ${t.emoji} ${t.name}</span>
+        <span class="pill" title="Total trivia points">⭐ ${p.score}</span><span class="pill bonus" title="Total bonus points">🧠 +${p.bonus}</span></div>
+        <div class="turn">${p.avatar} ${esc(p.name)} is exploring!</div>`; }
+    const t = S.topicId === 'mix' ? { emoji: '🔀', name: 'Mix It Up' } : topicById(S.topicId);
     return `<div class="hud"><button class="btn small" id="homeBtn" aria-label="Home">🏠</button><span class="pill">${t.emoji} ${t.name}</span>
       <span class="pill" title="Total trivia points">⭐ ${p.score}</span><span class="pill bonus" title="Total bonus points">🧠 +${p.bonus}</span></div>
       <div class="progress"><div style="width:${(S.idx / S.queue.length) * 100}%"></div></div>
       ${S.players.length > 1 ? `<div class="turn">${p.avatar} ${esc(p.name)}'s turn!</div>` : ''}`;
   }
-  function wireHome() { const b = $app.querySelector('#homeBtn'); if (b) b.onclick = () => { savePlayers(); renderHome(); toast('🎒 Switch topic? Your points come with you!'); }; }
+  function wireHome() { const b = $app.querySelector('#homeBtn'); if (b) b.onclick = () => { savePlayers(); S.dive = null; renderHome(); toast('🎒 Switch topic? Your points come with you!'); }; }
 
   function award(kind, pts) {
     const p = cur(); if (kind === 'bonus') { p.bonus += pts; p.rBonus += pts; } else { p.score += pts; p.rScore += pts; } savePlayers();
@@ -286,7 +332,7 @@
 
   function renderQuestion() {
     const q = S.queue[S.idx];
-    markSeen(q);
+    markSeen(q); S.dive = null;
     h(`${hud()}<section class="card" id="qcard"></section>`); wireHome();
     const card = $app.querySelector('#qcard');
     card.insertAdjacentHTML('beforebegin', `<p class="sub" style="margin:6px 0 0">Question ${S.idx + 1} of ${S.queue.length}</p>`);
@@ -296,61 +342,170 @@
         else addEvidence(cur().name, q.topic, q.skill, -0.5);
         if (!correct || tries) S.missed.push({ q, player: S.turn });
         if (!correct) rememberMiss(cur().name, q.topic, q.id);
-        acts.innerHTML = `
-          <button class="btn deep block" id="deepBtn">🧠 Think Deeper! <small>(+${DEEP_PTS} bonus each)</small></button>
-          <button class="btn primary block" id="nextBtn">${S.idx + 1 < S.queue.length ? 'Next question ➡️' : 'See results 🏁'}</button>`;
-        acts.querySelector('#deepBtn').onclick = () => renderDeeper(0);
-        acts.querySelector('#nextBtn').onclick = next;
+        S.dive = { mode: 'game', topic: q.topic, q, level: 0, visited: new Set(), holes: new Set() };
+        doorPanel(acts, null);
       } });
   }
 
-  function next() { stopSpeech(); S.idx++; S.turn = (S.turn + 1) % S.players.length; S.idx < S.queue.length ? renderQuestion() : startReview(); }
+  function next() { stopSpeech(); S.dive = null; S.idx++; S.turn = (S.turn + 1) % S.players.length; S.idx < S.queue.length ? renderQuestion() : startReview(); }
 
-  // ---------- THINK DEEPER (Socratic follow-up chain) ----------
-  function renderDeeper(k) {
-    const q = S.queue[S.idx], d = q.deeper[k], last = k === q.deeper.length - 1;
-    h(`${hud()}<section class="card"><div class="deepbanner"><span>🧠 Think Deeper ${k + 1}/${q.deeper.length}</span><span>${d.t === 'talk' ? '🗣️ Talk it out' : '🤔 Pick one'}</span></div><div id="dbody"></div></section>`); wireHome();
+  // ---------- RABBIT HOLES: kid-chosen curiosity doors, several levels deep ----------
+  const KINDS = { why: { e: '🤔', l: 'Why?' }, whatif: { e: '🔮', l: 'What if…?' }, more: { e: '🔍', l: 'Tell me more' }, hole: { e: '🕳️', l: 'Rabbit hole!' } };
+  const isExplored = id => !!nodeStore[id];
+  const levelPts = lvl => LEVEL_PTS[Math.min(lvl, LEVEL_PTS.length) - 1];
+  const holeExplored = hole => Object.keys(nodeStore).filter(k => k === `${hole.topic || ''}:${hole.id}` || k.startsWith(`${hole.topic || ''}:${hole.id}.`)).length;
+  const topicExplored = t => Object.keys(nodeStore).filter(k => k.startsWith(`${t.id}:`)).length;
+  const topicHoleNodes = t => (t.holes || []).reduce((a, h) => a + (h.size || 0), 0);
+  // Unexplored nodes whose parent has been explored (or the root): the "frontier" of a hole.
+  const frontier = hole => hole.all.filter(n => !isExplored(n.id) && !(S.dive && S.dive.visited.has(n.id)) && (n === hole.root || isExplored(NODE[n.id].parent.id)));
+  // Pick the rabbit hole that fits a question best (keyword match), preferring the least-explored one.
+  function holeFor(q) {
+    const hs = (topicById(q.topic).holes || []).filter(h => h.all); if (!hs.length) return null;
+    const text = `${q.q} ${q.c[0]} ${q.why}`, m = hs.filter(h => h.re.test(text)), pool = m.length ? m : hs;
+    const left = h => h.all.filter(n => !isExplored(n.id)).length / h.all.length;
+    return pool.slice().sort((a, b) => left(b) - left(a))[0];
+  }
+  function doorsFor(curId) {
+    const D = S.dive, fresh = n => !D.visited.has(n.id);
+    const byNew = arr => arr.filter(fresh).sort((a, b) => isExplored(a.id) - isExplored(b.id));
+    const info = curId && NODE[curId];
+    let out = [];
+    if (info && info.hole) {
+      out = byNew(info.n.next).map(n => ({ n }));
+      if (!out.length) out = frontier(info.hole).slice(0, 2).map(n => ({ n, jump: true }));
+    } else if (D.q) {
+      out = byNew(D.q.deeper).slice(0, 2).map(n => ({ n }));
+      const hole = holeFor(D.q); if (hole && !D.holes.has(hole.id)) out.push({ hole });
+    }
+    return out.slice(0, 3);
+  }
+  function doorHTML(d, i) {
+    const lvl = S.dive.level + 1;
+    if (d.hole) {
+      const ex = holeExplored(d.hole);
+      return `<button class="door k-hole" data-door="${i}"><span class="dk">${KINDS.hole.e} ${KINDS.hole.l}</span><span class="dt">${d.hole.emoji} ${esc(d.hole.title)}</span>
+        <span class="badge">${ex ? `${ex}/${d.hole.size} explored` : '✨ new'} · +${levelPts(lvl)}🧠</span></button>`;
+    }
+    const K = KINDS[d.n.k] || KINDS.more, been = isExplored(d.n.id);
+    return `<button class="door k-${d.n.k || 'more'}" data-door="${i}"><span class="dk">${K.e} ${K.l}</span><span class="dt">${esc(d.n.d || d.n.q)}</span>
+      <span class="badge">${been ? `✓ been here · +${REVISIT_PTS}` : `✨ new · +${levelPts(lvl)}`}🧠</span></button>`;
+  }
+  function doorPanel(acts, curId, override) {
+    const D = S.dive, doors = override ? override.doors : doorsFor(curId);
+    const backLabel = D.mode === 'explore' ? '🏁 Back to the rabbit holes'
+      : S.idx + 1 < S.queue.length ? (curId ? '🏁 Back to the game ➡️' : 'Next question ➡️') : 'See results 🏁';
+    const info = curId && NODE[curId];
+    const head = override ? override.head
+      : doors.length ? (curId ? (doors[0].jump ? '🏁 End of this tunnel! Other doors in this rabbit hole:' : '🚪 Where next? Pick a door!') : '🚪 Curious? Pick a door for 🧠 bonus — or keep playing!')
+      : (info && info.hole ? '🏆 You explored this WHOLE rabbit hole!' : '🎉 You opened every door here!');
+    acts.innerHTML = `<div class="doorhead">${head}</div><div class="doors">${doors.map(doorHTML).join('')}</div>
+      ${doors.length ? '<button class="btn small" id="readDoors">🔊 Read the doors</button>' : ''}
+      <button class="btn primary block" id="backBtn">${backLabel}</button>`;
+    acts.querySelectorAll('[data-door]').forEach(b => b.onclick = () => { stopSpeech(); const d = doors[+b.dataset.door]; d.hole ? enterHole(d.hole) : renderNode(d.n); });
+    acts.querySelector('#backBtn').onclick = leaveDive;
+    const say = () => speak(head.replace(/<[^>]+>/g, '') + ' ' + doors.map((d, i) => `${i ? 'Or, ' : ''}${d.hole ? 'Rabbit hole: ' + d.hole.title : (KINDS[d.n.k] || KINDS.more).l + ' ' + (d.n.d || d.n.q)}.`).join(' '));
+    const rd = acts.querySelector('#readDoors'); if (rd) rd.onclick = say;
+    if (S.autoRead && doors.length && curId) setTimeout(say, 900);
+  }
+  function leaveDive() { stopSpeech(); const D = S.dive; if (D && D.mode === 'explore') return renderExploreTopic(D.topic); next(); }
+  function enterHole(hole) {
+    const D = S.dive; D.holes.add(hole.id);
+    if (!isExplored(hole.root.id) && !D.visited.has(hole.root.id)) return renderNode(hole.root);
+    const doors = frontier(hole).slice(0, 3).map(n => ({ n, jump: true }));
+    h(`${hud()}<section class="card"><div class="deepbanner"><span>🕳️ ${hole.emoji} ${esc(hole.title)}</span><span>${holeExplored(hole)}/${hole.size} explored</span></div>
+      <div class="qtext">${doors.length ? 'Welcome back, explorer! 🔦 You\'ve been here before — pick a door you haven\'t opened yet:' : 'WOW — you explored this whole rabbit hole! 🏆 Want to wander it again? (+' + REVISIT_PTS + ' 🧠 per door)'}</div>
+      <div class="actions" id="lobby"></div></section>`); wireHome();
+    const acts = $app.querySelector('#lobby');
+    doorPanel(acts, null, doors.length ? { doors, head: '🚪 Unopened doors:' } : { doors: [{ n: hole.root }], head: '🔁 Start from the top:' });
+  }
+  function meter(lvl) {
+    return `<div class="meter" aria-label="rabbit hole level ${lvl}">${[1, 2, 3, 4, 5].map(i => `<span class="${i <= lvl ? 'on' : ''}">${i <= lvl ? '🐇' : '🕳️'}</span>`).join('')}${lvl > 5 ? `<b>+${lvl - 5}</b>` : ''}</div>`;
+  }
+  function renderNode(n) {
+    const D = S.dive, lvl = D.level + 1, info = NODE[n.id], been = isExplored(n.id);
+    const full = been ? REVISIT_PTS : levelPts(lvl), withClue = been ? REVISIT_PTS : Math.max(2, Math.round(full * 0.6));
+    const K = KINDS[n.k] || KINDS.more;
+    const where = info && info.hole ? `${info.hole.emoji} ${info.hole.title}` : '🧠 Think deeper';
+    h(`${hud()}<section class="card node k-${n.k || 'more'}"><div class="deepbanner"><span>🐇 Rabbit hole level ${lvl}!</span><span>${K.e} ${K.l}</span></div>
+      ${meter(lvl)}<p class="where">${esc(where)} · ${been ? `✓ been here (+${REVISIT_PTS})` : `+${full} 🧠`}</p><div id="dbody"></div></section>
+      <button class="btn small stopbtn" id="stopBtn">🏁 ${D.mode === 'explore' ? 'Stop & go back to the rabbit holes' : 'Stop & go back to the game'}</button>`); wireHome();
+    $app.querySelector('#stopBtn').onclick = leaveDive;
     const body = $app.querySelector('#dbody');
-    const after = (acts) => {
-      acts.innerHTML = `${last ? '' : `<button class="btn deep block" id="moreDeep">🧠 Go even deeper! (${k + 2}/${q.deeper.length})</button>`}
-        <button class="btn primary block" id="backBtn">${S.idx + 1 < S.queue.length ? (last ? 'Deep thinker! Next question ➡️' : 'Next question ➡️') : 'See results 🏁'}</button>`;
-      if (!last) acts.querySelector('#moreDeep').onclick = () => renderDeeper(k + 1);
-      acts.querySelector('#backBtn').onclick = next;
-      if (last) { confetti(80); }
+    const done = (ok, usedClue, acts) => {
+      $app.querySelector('#stopBtn').remove();
+      D.level = lvl; S.maxLevel = Math.max(S.maxLevel || 0, lvl); D.visited.add(n.id);
+      nodeStore[n.id] = 1; store.set('kt_nodes', nodeStore);
+      if (ok) { award('bonus', usedClue ? withClue : full); if (D.mode === 'game') addEvidence(cur().name, D.q.topic, D.q.skill, 0.5); S.deepAnswered = (S.deepAnswered || 0) + 1; }
+      if (lvl === 3 || lvl === 5 || lvl === 8) { confetti(160); body.querySelector('.fb').insertAdjacentHTML('beforeend', `<div class="feedback deepbox">${lvl >= 5 ? '🐇🐇🐇 LEVEL ' + lvl + '! You\'re a SUPER-deep thinker!' : '🐇 Level 3 — you\'re really digging in!'}</div>`); }
+      doorPanel(acts, n.id);
     };
-    if (d.t === 'mc') {
-      mcWidget({ container: body, q: d.q, choices: d.c, hint: d.hint, why: d.why, justTell: true,
-        onDone: ({ correct, tries, told, acts }) => {
-          if (correct) { const pts = tries ? DEEP_PTS_CLUE : DEEP_PTS; award('bonus', pts); addEvidence(cur().name, q.topic, q.skill, 0.5); S.deepAnswered++; }
-          after(acts);
-        } });
+    if (n.t === 'mc') {
+      mcWidget({ container: body, q: n.q, choices: n.c, hint: n.hint, why: n.why, justTell: true,
+        onDone: ({ correct, tries, acts }) => done(correct, tries > 0, acts) });
     } else {
       body.innerHTML = `
         <button class="speak" aria-label="Read aloud">🔊</button>
-        <div class="qtext">${esc(d.q)}</div>
+        <div class="qtext">${esc(n.q)}</div>
         <div class="talkbox">🗣️ <b>Say your answer out loud!</b> Then a grown-up decides: did you explain your thinking?</div>
-        <details class="peek"><summary>👀 Grown-up peek: what a great answer mentions</summary><p>${esc(d.peek)}</p></details>
+        <details class="peek"><summary>👀 Grown-up peek: what a great answer mentions</summary><p>${esc(n.peek)}</p></details>
         <div class="fb"></div>
         <div class="actions">
-          <button class="btn go block" id="goodBtn">🌟 Good thinking! +${DEEP_PTS}</button>
+          <button class="btn go block" id="goodBtn">🌟 Good thinking! +${full}</button>
           <button class="btn block" id="clueBtn">🤔 Need a clue</button>
-          <button class="btn small" id="skipBtn">⏭️ Skip this one</button>
+          <button class="btn small" id="skipBtn">🙋 Just tell me</button>
         </div>`;
       const fb = body.querySelector('.fb'), acts = body.querySelector('.actions');
-      body.querySelector('.speak').onclick = () => speak(d.q);
-      if (S.autoRead) setTimeout(() => speak(d.q), 250);
-      const good = (pts) => { stopSpeech(); yay(); confetti(); award('bonus', pts); addEvidence(cur().name, q.topic, q.skill, 0.5); S.deepAnswered++;
-        fb.innerHTML = `<div class="feedback good"><b class="big">${pick(CHEERS)}</b>Great explaining! A great answer: ${esc(d.peek)}</div>`; after(acts); };
-      acts.querySelector('#goodBtn').onclick = () => good(DEEP_PTS);
-      acts.querySelector('#skipBtn').onclick = () => { stopSpeech(); fb.innerHTML = `<div class="feedback bad"><b class="big">No problem! 💡</b>One idea: ${esc(d.peek)}</div>`; after(acts); };
+      body.querySelector('.speak').onclick = () => speak(n.q);
+      if (S.autoRead) setTimeout(() => speak(n.q), 250);
+      const good = (usedClue) => { stopSpeech(); yay(); confetti();
+        fb.innerHTML = `<div class="feedback good"><b class="big">${pick(CHEERS)}</b>Great explaining! A great answer: ${esc(n.peek)}</div>`; done(true, usedClue, acts); };
+      acts.querySelector('#goodBtn').onclick = () => good(false);
+      acts.querySelector('#skipBtn').onclick = () => { stopSpeech(); fb.innerHTML = `<div class="feedback bad"><b class="big">No problem! 💡</b>One idea: ${esc(n.peek)}</div>`; done(false, false, acts); };
       acts.querySelector('#clueBtn').onclick = () => {
-        fb.innerHTML = `<div class="feedback clue"><b class="big">🔎 Clue question:</b>${esc(d.clue)}</div>`;
-        if (S.autoRead) speak(d.clue);
-        acts.innerHTML = `<button class="btn go block" id="good2">🌟 Got it! +${DEEP_PTS_CLUE}</button><button class="btn small" id="skip2">⏭️ Tell us & move on</button>`;
-        acts.querySelector('#good2').onclick = () => good(DEEP_PTS_CLUE);
-        acts.querySelector('#skip2').onclick = () => { stopSpeech(); fb.innerHTML = `<div class="feedback bad"><b class="big">Good try! 💪</b>One idea: ${esc(d.peek)}</div>`; after(acts); };
+        fb.innerHTML = `<div class="feedback clue"><b class="big">🔎 Clue question:</b>${esc(n.clue)}</div>`;
+        if (S.autoRead) speak(n.clue);
+        acts.innerHTML = `<button class="btn go block" id="good2">🌟 Got it! +${withClue}</button><button class="btn small" id="skip2">🙋 Tell us</button>`;
+        acts.querySelector('#good2').onclick = () => good(true);
+        acts.querySelector('#skip2').onclick = () => { stopSpeech(); fb.innerHTML = `<div class="feedback bad"><b class="big">Good try! 💪</b>One idea: ${esc(n.peek)}</div>`; done(false, false, acts); };
       };
     }
+  }
+
+  // ---------- RABBIT HOLES explore mode (from home: no 10-question structure) ----------
+  function renderExploreHome() {
+    stopSpeech(); S.dive = null;
+    if (!S.players.length) { S.players.push({ name: 'Player 1', avatar: '🦊', score: 0, bonus: 0, rScore: 0, rBonus: 0 }); savePlayers(); }
+    if (!(S.turn >= 0 && S.turn < S.players.length)) S.turn = 0;
+    h(`<h1>🕳️ Rabbit Holes</h1><p class="sub">No quiz — follow your curiosity as deep as you want!</p>
+      <section class="card"><h2>🧭 Who's exploring?</h2>
+        <div class="players">${S.players.map((p, i) => `<button class="chip pick ${i === S.turn ? 'on' : ''}" data-who="${i}">${p.avatar} ${esc(p.name)} <span class="tot">🧠${p.bonus}</span></button>`).join('')}</div>
+        <p class="muted" style="margin:0">🧠 Bonus points go to the explorer — and they add up with game points!</p></section>
+      <section class="card"><h2>🎯 Pick a topic</h2><div class="topics">
+        ${DATA.topics.map(t => `<button class="topic" style="background:${t.color}" data-xt="${t.id}"><span class="em">${t.emoji}</span>${t.name}<span class="explored">🕳️ ${(t.holes || []).length} holes · 🐇 ${topicExplored(t)}/${topicHoleNodes(t)}</span></button>`).join('')}
+      </div></section>
+      <div class="actions"><button class="btn primary block" id="xhome">🏠 Back home</button></div>`);
+    $app.querySelectorAll('[data-who]').forEach(b => b.onclick = () => { S.turn = +b.dataset.who; bling(); renderExploreHome(); });
+    $app.querySelectorAll('[data-xt]').forEach(b => b.onclick = () => renderExploreTopic(b.dataset.xt));
+    $app.querySelector('#xhome').onclick = renderHome;
+  }
+  function renderExploreTopic(tid) {
+    stopSpeech();
+    return ensureTopics([tid]).then(() => {
+      const t = topicById(tid); S.dive = null;
+      const p = S.players[S.turn] || S.players[0];
+      h(`<div class="hud"><button class="btn small" id="homeBtn" aria-label="Home">🏠</button><span class="pill">🕳️ ${t.emoji} ${t.name}</span><span class="pill bonus">🧠 +${p.bonus}</span></div>
+        <div class="turn">${p.avatar} ${esc(p.name)} is exploring!</div>
+        <section class="card"><h2>🕳️ Pick a rabbit hole</h2><p class="muted" style="margin-top:0">Each one has doors inside doors. How deep can you go?</p>
+        <div class="holes">${t.holes.map((hole, i) => { const ex = holeExplored(hole), pct = Math.round(ex / hole.size * 100);
+          return `<button class="holecard" data-h="${i}"><span class="em">${hole.emoji}</span><span class="ht">${esc(hole.title)}<small>${ex === hole.size ? '🏆 fully explored!' : ex ? `${hole.size - ex} doors left` : '✨ new!'}</small></span>
+            <span class="hbar"><span style="width:${pct}%"></span></span><span class="hc">${ex}/${hole.size}</span></button>`; }).join('')}</div>
+        <button class="btn holebtn block" id="randHole" style="margin-top:12px">🎲 Surprise rabbit hole!</button></section>
+        <div class="actions"><button class="btn block" id="xback">⬅️ Other topics</button></div>`); wireHome();
+      const dive = hole => { S.dive = { mode: 'explore', topic: tid, q: null, level: 0, visited: new Set(), holes: new Set() }; enterHole(hole); };
+      $app.querySelectorAll('[data-h]').forEach(b => b.onclick = () => dive(t.holes[+b.dataset.h]));
+      $app.querySelector('#randHole').onclick = () => { const fresh = t.holes.filter(h => holeExplored(h) < h.size); dive(pick(fresh.length ? fresh : t.holes)); };
+      $app.querySelector('#xback').onclick = renderExploreHome;
+    }).catch(() => {});
   }
 
   // ---------- SPACED REVIEW ----------
@@ -396,7 +551,8 @@
     const msg = S.players.length > 1 ? `Awesome game, everyone! 🎉` : (top.rScore >= 80 ? 'TRIVIA CHAMPION! 🏆' : top.rScore >= 50 ? 'Super smart! 🌟' : 'Great playing — your brain grew today! 🌱');
     h(`<section class="card results center"><div class="big-emoji">🏆</div><h2 style="font-size:1.8rem">${msg}</h2>
         ${ranked.map((p, i) => `<div class="player"><span>${S.players.length > 1 ? medals[i] : ''} ${p.avatar} ${esc(p.name)}</span><span class="pts"><b class="round">+${p.round}</b><small>this round (⭐${p.rScore} 🧠${p.rBonus})</small><small>🎒 total <b>${p.total}</b> (⭐${p.score} 🧠${p.bonus})</small></span></div>`).join('')}
-        <p class="muted">⭐ = trivia points · 🧠 = Think Deeper bonus · 🎒 totals carry across topics</p>
+        <p class="muted">⭐ = trivia points · 🧠 = rabbit-hole bonus · 🎒 totals carry across topics</p>
+        ${S.maxLevel ? `<div class="explore-banner">🐇 Deepest rabbit hole this game: <b>level ${S.maxLevel}</b>${S.maxLevel >= 5 ? ' — SUPER-deep thinker! 🏆' : ''}</div>` : ''}
         <div class="explore-banner">${S.justFinishedLap ? `🎉 You explored EVERY ${esc(topicById(S.justFinishedLap).name)} question! Next game reshuffles them all.` : exploredLabel(S.topicId)}</div>
       </section>
       <section class="card"><h2>🗺️ Brain Map</h2><p class="muted" style="margin-top:0">Levels go up as you answer things right more than once — and come down if you forget. Keep playing to reach 5/5!</p>
@@ -407,6 +563,6 @@
     $app.querySelector('#home').onclick = renderHome;
   }
 
-  window.__kt = { S, startTopic, renderHome, drawQuestions, seen: () => seenStore }; // for testing
+  window.__kt = { S, startTopic, renderHome, drawQuestions, seen: () => seenStore, nodes: () => nodeStore, NODE, QBYID, ensureTopics, renderExploreHome, renderExploreTopic, holeFor, topicById, renderQuestion }; // for testing
   renderHome();
 })();
