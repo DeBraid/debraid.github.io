@@ -118,3 +118,9 @@ details.peek summary{cursor:pointer;font-weight:800}
 .holecard .hbar{grid-column:2/4;height:10px;background:#ddd3ff;border-radius:99px;overflow:hidden}
 .holecard .hbar span{display:block;height:100%;background:linear-gradient(90deg,#7b3cff,#ff4fa3)}
 .chip.pick.on .tot{color:var(--ink)}
+.voicebox{margin-top:14px;border-top:2px dashed #c9bdf0;padding-top:12px}
+.vlabel{display:block;font-weight:900;font-size:1.1rem;margin-bottom:6px}
+.vrow{flex-wrap:nowrap}
+.vrow select{flex:1;min-width:0;font:inherit;font-size:1rem;padding:10px 12px;border-radius:14px;border:3px solid #d9cfff;background:#fff;min-height:46px}
+.vrow .btn{flex:none}
+.vtip{margin:8px 0 0;font-size:.95rem}
